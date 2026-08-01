@@ -1,0 +1,195 @@
+# Custom Falco rules — detection only.
+# Tested against Falco 0.38+ rule syntax (required_engine_version 0.31.0).
+# Deployed via the helm chart's customRules value (see deploy/falco-values.yaml).
+#
+# Philosophy: few rules, each mapped to a real attacker behaviour, each with
+# an output line that contains everything the responder needs (see
+# docs/triage-workflow.md). A rule nobody triages is worse than no rule.
+
+- required_engine_version: 0.31.0
+
+# ---------------------------------------------------------------------------
+# Lists / macros shared by the rules below
+# ---------------------------------------------------------------------------
+
+- list: shell_binaries_custom
+  items: [bash, sh, zsh, ash, dash, ksh]
+
+- list: mining_pool_ports
+  # Common stratum protocol ports. Port alone is weak evidence — the rule
+  # combines it with domain matching where DNS is visible.
+  items: [3333, 4444, 5555, 7777, 14444, 14433]
+
+- list: mining_domains
+  items: [
+    "pool.minexmr.com", "xmr.pool.minergate.com", "pool.supportxmr.com",
+    "xmrpool.eu", "nanopool.org", "moneroocean.stream", "c3pool.com",
+    "hashvault.pro", "2miners.com"
+  ]
+
+- macro: custom_container
+  condition: (container.id != host)
+
+- macro: sensitive_host_paths
+  # Mount targets that grant node control from inside a container
+  condition: >
+    (fd.name startswith /host/etc or
+     fd.name startswith /host/root/.ssh or
+     fd.name startswith /host/var/lib/kubelet or
+     fd.name startswith /host/etc/kubernetes)
+
+# ---------------------------------------------------------------------------
+# 1. Interactive shell spawned in a container
+# ---------------------------------------------------------------------------
+- rule: Interactive Shell in Container
+  desc: >
+    An interactive shell (attached tty) started inside a container. Legit for
+    debugging; also the first move after almost every successful container
+    exploit. Kept at NOTICE and paired with rule 2, which pinpoints the
+    kubectl-exec case specifically.
+  condition: >
+    spawned_process and custom_container
+    and proc.name in (shell_binaries_custom)
+    and proc.tty != 0
+    and container.image.repository != "docker.io/library/busybox"
+  output: >
+    Interactive shell in container
+    (user=%user.name user_loginuid=%user.loginuid shell=%proc.name
+    parent=%proc.pname cmdline=%proc.cmdline
+    container_id=%container.id container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: NOTICE
+  tags: [container, shell, mitre_execution, T1059.004]
+
+# ---------------------------------------------------------------------------
+# 2. Shell via kubectl exec (attach/exec session)
+# ---------------------------------------------------------------------------
+- rule: Shell Spawned via Kubectl Exec
+  desc: >
+    Shell whose parent process chain indicates a kubectl exec / attach session
+    (runc/containerd-shim direct parent rather than the container entrypoint).
+    Correlate with Kubernetes audit logs to attribute the human identity:
+    this rule gives you when/where, the audit log gives you who.
+  condition: >
+    spawned_process and custom_container
+    and proc.name in (shell_binaries_custom)
+    and proc.tty != 0
+    and (proc.pname in (runc, containerd-shim, conmon, crun) or proc.vpid = 1)
+  output: >
+    Shell started via exec session in container
+    (user=%user.name shell=%proc.name parent=%proc.pname
+    cmdline=%proc.cmdline container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [container, shell, mitre_execution, T1609]
+
+# ---------------------------------------------------------------------------
+# 3. Sensitive host path opened from a container
+# ---------------------------------------------------------------------------
+- rule: Sensitive Host Path Opened in Container
+  desc: >
+    A container read a host-mounted sensitive path (kubelet state, host /etc,
+    root's SSH keys, control plane certs). With standard hostPath mounts under
+    /host, this catches container-escape reconnaissance and over-broad mounts
+    alike. Node agents that legitimately need this are excluded by namespace
+    in rules/tuning-noisy-defaults.yaml, not here.
+  condition: >
+    open_read and custom_container and sensitive_host_paths
+  output: >
+    Sensitive host path opened from container
+    (file=%fd.name user=%user.name proc=%proc.name cmdline=%proc.cmdline
+    container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [container, filesystem, mitre_credential_access, T1552]
+
+# ---------------------------------------------------------------------------
+# 4. Outbound connection to a known mining pool
+# ---------------------------------------------------------------------------
+- rule: Outbound Connection to Mining Pool
+  desc: >
+    Outbound connection to a known mining pool domain or a stratum port.
+    Cryptomining is the most common post-compromise payload in Kubernetes —
+    it is loud in CPU graphs but this fires within seconds, not at the next
+    billing review. Domain match is HIGH confidence; bare port match is
+    supporting evidence (some legit services use 4444/5555 — tune per
+    environment).
+  condition: >
+    outbound and custom_container
+    and (fd.sip.name in (mining_domains) or fd.sport in (mining_pool_ports))
+  output: >
+    Possible mining pool connection from container
+    (dest=%fd.sip.name:%fd.sport proc=%proc.name cmdline=%proc.cmdline
+    container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: CRITICAL
+  tags: [network, container, mitre_impact, T1496]
+
+# ---------------------------------------------------------------------------
+# 5. Package manager executed in a running container
+# ---------------------------------------------------------------------------
+- rule: Package Manager in Container
+  desc: >
+    apt/apk/yum/pip executed inside a running container. Images are immutable
+    by design; installing software at runtime is either a broken build
+    process or an attacker staging tools. Exceptions for CI/build namespaces
+    live in the tuning overlay.
+  condition: >
+    spawned_process and custom_container
+    and proc.name in (apt, apt-get, apk, dpkg, yum, dnf, rpm, pip, pip3)
+  output: >
+    Package manager run in container
+    (proc=%proc.name cmdline=%proc.cmdline user=%user.name
+    container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [container, mitre_persistence, T1505]
+
+# ---------------------------------------------------------------------------
+# 6. Kernel module loading from a container
+# ---------------------------------------------------------------------------
+- rule: Kernel Module Load from Container
+  desc: >
+    init_module/finit_module syscalls or modprobe/insmod executed from a
+    container. Almost nothing legitimate does this (CNI/storage/security
+    agents excepted — excluded in the tuning overlay); it is a classic
+    container-escape and rootkit-staging step.
+  condition: >
+    custom_container
+    and ((evt.type in (init_module, finit_module) and evt.dir = <)
+         or (spawned_process and proc.name in (modprobe, insmod)))
+  output: >
+    Kernel module operation from container
+    (evt=%evt.type proc=%proc.name cmdline=%proc.cmdline
+    container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: CRITICAL
+  tags: [container, kernel, mitre_privilege_escalation, T1547.006]
+
+# ---------------------------------------------------------------------------
+# 7. Service account token read by an unexpected process
+# ---------------------------------------------------------------------------
+- rule: Unexpected Read of ServiceAccount Token
+  desc: >
+    Read of the mounted service account token by shells or download tools
+    rather than the application runtime. Applications read the token through
+    their Kubernetes client library at startup; curl/cat reading it mid-life
+    is credential harvesting until proven otherwise.
+  condition: >
+    open_read and custom_container
+    and fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount
+    and proc.name in (cat, curl, wget, base64, less, head, tail, nc, ncat)
+  output: >
+    ServiceAccount token read by suspicious process
+    (file=%fd.name proc=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+    container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    k8s_pod=%k8s.pod.name k8s_ns=%k8s.ns.name)
+  priority: WARNING
+  tags: [container, mitre_credential_access, T1528]

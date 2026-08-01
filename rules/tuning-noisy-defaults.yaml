@@ -1,0 +1,109 @@
+# Tuning overlay — loaded AFTER the default ruleset and custom-rules.yaml
+# (file order in falco.rules_files / helm customRules matters).
+#
+# Two techniques, used deliberately:
+#   * exceptions  — surgical carve-outs; preferred, because each exception
+#                   names exactly what it exempts and why.
+#   * override    — appending conditions or changing priority/enabled on
+#                   existing rules (Falco 0.36+ override syntax).
+#
+# Every entry keeps a comment with the reason. An exception without a reason
+# is a detection hole with extra steps.
+
+- required_engine_version: 0.31.0
+
+# ---------------------------------------------------------------------------
+# Default ruleset: "Read sensitive file untrusted"
+# Noise source: node-level monitoring agents legitimately reading /etc/shadow
+# adjacent files, and sssd/authn tooling on some distros.
+# ---------------------------------------------------------------------------
+- rule: Read sensitive file untrusted
+  exceptions:
+    - name: monitoring_agents
+      fields: [proc.name, fd.name]
+      comps: [in, startswith]
+      values:
+        - [[node-exporter, telegraf], /etc/passwd]
+
+# ---------------------------------------------------------------------------
+# Default ruleset: "Change thread namespace"
+# Noise source: CNI plugins and service mesh init containers do this on every
+# pod start. Excluding by process list is safer than disabling the rule.
+# ---------------------------------------------------------------------------
+- rule: Change thread namespace
+  exceptions:
+    - name: cni_and_mesh
+      fields: [proc.name, k8s.ns.name]
+      comps: [in, in]
+      values:
+        - [[calico-node, cilium-agent, istio-init], [kube-system, istio-system]]
+
+# ---------------------------------------------------------------------------
+# Default ruleset: "Contact K8S API Server From Container"
+# Noise source: every operator, controller, and workload using the k8s client
+# talks to the API server; the default rule drowns real signal. Downgrade
+# instead of disable — the events remain available for hunting, and
+# credential-theft coverage comes from the SA-token rule in custom-rules.yaml.
+# ---------------------------------------------------------------------------
+- rule: Contact K8S API Server From Container
+  override:
+    priority: replace
+  priority: DEBUG
+
+# ---------------------------------------------------------------------------
+# Custom rule: "Interactive Shell in Container"
+# Carve-outs: the debug tooling namespace (short-lived troubleshooting pods)
+# and CI runner pods, where shells are the workload itself.
+# ---------------------------------------------------------------------------
+- rule: Interactive Shell in Container
+  exceptions:
+    - name: debug_namespace
+      fields: [k8s.ns.name]
+      comps: [in]
+      values:
+        - [[debug-tools]]
+    - name: ci_runners
+      fields: [k8s.ns.name, container.image.repository]
+      comps: ["=", startswith]
+      values:
+        - [gitlab-runners, registry.gitlab.com/example-org/ci]
+
+# ---------------------------------------------------------------------------
+# Custom rule: "Package Manager in Container"
+# Carve-out: CI build namespaces, where package installs are the job.
+# ---------------------------------------------------------------------------
+- rule: Package Manager in Container
+  exceptions:
+    - name: ci_build_namespaces
+      fields: [k8s.ns.name]
+      comps: [in]
+      values:
+        - [[gitlab-runners, kaniko-builds]]
+
+# ---------------------------------------------------------------------------
+# Custom rule: "Sensitive Host Path Opened in Container"
+# Carve-out: node agents whose whole job is reading node state. Scoped to
+# namespace + image prefix so a compromised app pod in another namespace
+# reusing the binary name is still caught.
+# ---------------------------------------------------------------------------
+- rule: Sensitive Host Path Opened in Container
+  exceptions:
+    - name: node_agents
+      fields: [k8s.ns.name, container.image.repository]
+      comps: [in, startswith]
+      values:
+        - [[kube-system, monitoring, falco], registry.k8s.io]
+        - [[monitoring], quay.io/prometheus]
+
+# ---------------------------------------------------------------------------
+# Custom rule: "Kernel Module Load from Container"
+# Carve-out: only kube-system node infrastructure. Nothing outside it gets
+# an exception for kernel modules — ever.
+# ---------------------------------------------------------------------------
+- rule: Kernel Module Load from Container
+  exceptions:
+    - name: node_infrastructure
+      fields: [k8s.ns.name]
+      comps: [in]
+      values:
+        - [[kube-system]]

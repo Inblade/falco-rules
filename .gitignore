@@ -1,0 +1,10 @@
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local secrets — Slack webhook URLs never belong in git
+*webhook*
+secrets.yaml
+kubeconfig*

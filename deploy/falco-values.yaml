@@ -1,0 +1,74 @@
+# Helm values for the falcosecurity/falco chart (chart 4.x, Falco 0.38+),
+# with Falcosidekick routing alerts to Slack.
+#
+#   helm repo add falcosecurity https://falcosecurity.github.io/charts
+#   helm upgrade --install falco falcosecurity/falco \
+#     --namespace falco --create-namespace \
+#     -f deploy/falco-values.yaml \
+#     --set falcosidekick.config.slack.webhookurl="$SLACK_WEBHOOK_URL"
+#
+# The webhook URL is a secret — inject it at deploy time (as above, or via
+# falcosidekick.config.existingSecret). Never commit it to values.
+
+driver:
+  enabled: true
+  kind: modern_ebpf   # CO-RE eBPF: no kernel-header builds, works on modern kernels (5.8+)
+
+tty: true             # unbuffered output -> alerts ship immediately, not per-block
+
+falco:
+  json_output: true
+  json_include_output_property: true
+  priority: debug     # emit everything; routing thresholds live in falcosidekick
+  http_output:
+    enabled: true     # -> falcosidekick (the chart wires the URL automatically)
+
+# Custom rules are rendered into /etc/falco/rules.d/ in filename order —
+# keep the tuning overlay lexically after the rules it overrides.
+customRules:
+  10-custom-rules.yaml: |-
+    # contents of rules/custom-rules.yaml — inline here, or install via
+    # `helm ... --set-file 'customRules.10-custom-rules\.yaml'=rules/custom-rules.yaml`
+  90-tuning-noisy-defaults.yaml: |-
+    # contents of rules/tuning-noisy-defaults.yaml — same mechanism
+
+# Keep Falco itself honest about resources — it is a per-node agent.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+controller:
+  kind: daemonset
+
+falcosidekick:
+  enabled: true
+  replicaCount: 2
+  config:
+    # Only WARNING and above leave the cluster; NOTICE/INFO stay in logs
+    # and metrics. This threshold is the main knob for alert fatigue.
+    minimumpriority: warning
+    slack:
+      # webhookurl injected at deploy time — see header comment
+      webhookurl: ""
+      channel: "#security-alerts"
+      username: "falco"
+      minimumpriority: warning
+      messageformat: |-
+        *{{ .Rule }}* ({{ .Priority }}) — pod `{{ index .OutputFields "k8s.pod.name" }}` ns `{{ index .OutputFields "k8s.ns.name" }}`
+  webui:
+    enabled: true     # small event browser; handy for triage without log-diving
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# Scrape falco + sidekick metrics if kube-prometheus-stack is present.
+metrics:
+  enabled: true
+serviceMonitor:
+  create: false   # set true when the Prometheus Operator CRDs exist
